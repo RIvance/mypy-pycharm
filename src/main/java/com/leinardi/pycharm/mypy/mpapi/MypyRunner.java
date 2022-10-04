@@ -47,7 +47,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.InterruptedIOException;
-import java.nio.charset.Charset;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -88,12 +89,9 @@ public class MypyRunner {
             return false;
         }
         GeneralCommandLine cmd = getMypyCommandLine(project, mypyPath);
-        boolean daemon = false;
-        if (daemon) {
-            cmd.addParameter("status");
-        } else {
-            cmd.addParameter("-V");
-        }
+
+        cmd.addParameter("-V");
+
         final Process process;
         try {
             process = cmd.createProcess();
@@ -273,19 +271,23 @@ public class MypyRunner {
         if (filesToScan.isEmpty()) {
             return Collections.emptyList();
         }
-        boolean daemon = false;
+
+        if (mypyConfigService.isUseDaemon()) {
+            // build path to dmypy by assuming that it sits right next to the selected mypy executable
+            // with the only difference being that the name has "dmypy" in it rather than just "mypy"
+            Path p = Paths.get(mypyPath);
+            String dFile = p.getFileName().toString().replace("mypy", "dmypy");
+            mypyPath = Paths.get(p.getParent().toString(), dFile).toString();
+        }
 
         GeneralCommandLine cmd = new GeneralCommandLine(mypyPath);
-        cmd.setCharset(Charset.forName("UTF-8"));
-        if (daemon) {
+        cmd.setCharset(UTF_8);
+        if (mypyConfigService.isUseDaemon()) {
             cmd.addParameter("run");
             cmd.addParameter("--");
-            cmd.addParameter("``--show-column-numbers");
-        } else {
-            cmd.addParameter("--show-column-numbers");
         }
-        cmd.addParameter("--follow-imports");
-        cmd.addParameter("silent");
+
+        cmd.addParameter("--show-column-numbers");
 
         injectEnvironmentVariables(project, cmd);
 
@@ -301,35 +303,33 @@ public class MypyRunner {
             cmd.addParameter(file);
         }
         cmd.setWorkDirectory(project.getBasePath());
-        final Process process;
 
+        LOG.debug("Command Line string: " + cmd.getCommandLineString());
+        
         try {
-            LOG.info("Running command: " + cmd.getCommandLineString());
-            process = cmd.createProcess();
-            InputStream inputStream = process.getInputStream();
-            assert (inputStream != null);
+            final int retryLimit = 5;
+            InputStream inputStream = null;
+            for (int retryCount = 1; retryCount <= retryLimit; retryCount++) {
+                final Process process = cmd.createProcess();
+                inputStream = process.getInputStream();
 
-            List<Issue> issues = parseMypyOutput(inputStream);
-            process.waitFor();
-
-            int exitCode = process.exitValue();
-            if (exitCode != 0 && exitCode != 1) {
-                // Ideally, anything other than 0 or 1 should be an abnormal exit code,
-                // but there are still cases where Mypy returns 2 and still reports errors
-                // (e.g. syntax errors or "break" outside loop).
-                // See https://github.com/python/mypy/issues/6003.
-                if (issues.size() == 0) {
-                    InputStream errStream = process.getErrorStream();
-                    String detail = new BufferedReader(new InputStreamReader(errStream))
-                            .lines().collect(Collectors.joining("\n"));
-
-                    Notifications.showMypyAbnormalExit(project, detail);
-                    throw new MypyToolException("Mypy failed with code " + exitCode);
+                String error = new BufferedReader(new InputStreamReader(process.getErrorStream(), UTF_8))
+                        .lines().collect(Collectors.joining("\n"));
+                if (StringUtil.isEmpty(error)) {
+                    break;
                 } else {
-                    LOG.info("Mypy returned " + exitCode + ", but also reported issues");
+                    LOG.info("Command Line string: " + cmd.getCommandLineString());
+                    // the daemon sometimes fails when idea invokes the inspection multiple times
+                    if (mypyConfigService.isUseDaemon() && error.equals("The connection is busy.")) {
+                        LOG.warn(error + " attempt #" + retryCount);
+                    } else {
+                        throw new MypyToolException("Error while running Mypy: " + error);
+                    }
                 }
             }
-            return issues;
+
+            //  process.waitFor();
+            return parseMypyOutput(inputStream);
 
         } catch (InterruptedIOException e) {
             LOG.info("Command Line string: " + cmd.getCommandLineString());
